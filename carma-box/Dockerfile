@@ -6,7 +6,7 @@ RUN apk add --no-cache git
 
 # Clone application from GitHub
 WORKDIR /opt
-RUN git clone --depth 1 --branch v2.0.0 \
+RUN git clone --depth 1 --branch master \
     https://github.com/11z4t/carma-box-v2.git carma-box
 
 WORKDIR /opt/carma-box
