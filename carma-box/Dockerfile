@@ -1,17 +1,7 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Base image has Python 3.12. Install git for clone.
-RUN apk add --no-cache git tzdata
-
-# Clone application from GitHub (cache-bust via BUILD_DATE)
-ARG BUILD_DATE=unknown
-WORKDIR /opt
-RUN git clone --depth 1 --branch master \
-    https://github.com/11z4t/carma-box-v2.git carma-box \
-    && echo "Built: ${BUILD_DATE}"
-
-WORKDIR /opt/carma-box
+RUN apk add --no-cache tzdata
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir --break-system-packages \
@@ -20,6 +10,11 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     pyyaml>=6.0 \
     aiosqlite>=0.19 \
     structlog>=24.1
+
+# Copy application source (no git clone — eliminates Docker cache issues)
+COPY app/ /opt/carma-box/
+
+WORKDIR /opt/carma-box
 
 # Copy add-on specific files
 COPY run.sh /
