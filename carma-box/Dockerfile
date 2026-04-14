@@ -2,7 +2,7 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # Base image has Python 3.12. Install git for clone.
-RUN apk add --no-cache git
+RUN apk add --no-cache git tzdata
 
 # Clone application from GitHub (cache-bust via BUILD_DATE)
 ARG BUILD_DATE=unknown
