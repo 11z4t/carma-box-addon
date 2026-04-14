@@ -1,11 +1,8 @@
 #!/usr/bin/with-contenv bashio
 
-CONFIG_DIR="/addon_configs/carma_box"
+CONFIG_DIR="/config"
 SITE_CONFIG="${CONFIG_DIR}/site.yaml"
 EXAMPLE_CONFIG="/opt/carma-box/addon-config/site.yaml.example"
-
-# Ensure config directory
-mkdir -p "${CONFIG_DIR}"
 
 # Copy example config if none exists
 if [ ! -f "${SITE_CONFIG}" ]; then
