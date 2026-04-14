@@ -1,6 +1,6 @@
 name: "CARMA Box"
 description: "Smart Energy Optimization — solar, battery, EV, surplus dispatch"
-version: "2.1.4"
+version: "2.1.5"
 slug: "carma_box"
 url: "https://github.com/11z4t/carma-box-v2"
 arch:
