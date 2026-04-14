@@ -3,7 +3,7 @@ FROM ${BUILD_FROM}
 
 # Base image has Python 3.12. Install git for clone.
 RUN apk add --no-cache git tzdata \
-    && echo "cache-bust-2026-04-14T20:00"
+    && echo "cache-bust-2026-04-14T20:45"
 
 # Clone application from GitHub (cache-bust via BUILD_DATE)
 ARG BUILD_DATE=unknown
