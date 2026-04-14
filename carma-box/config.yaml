@@ -1,0 +1,24 @@
+name: "CARMA Box"
+description: "Smart Energy Optimization — solar, battery, EV, surplus dispatch"
+version: "2.0.0"
+slug: "carma_box"
+url: "https://github.com/11z4t/carma-box-v2"
+image: "ghcr.io/11z4t/carma-box-{arch}"
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: application
+boot: auto
+homeassistant_api: true
+hassio_api: true
+map:
+  - addon_config:rw
+options:
+  log_level: "INFO"
+schema:
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
+ports:
+  8412/tcp: 8412
+ports_description:
+  8412/tcp: "Health + Prometheus metrics"
