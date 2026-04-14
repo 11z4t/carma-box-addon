@@ -3,7 +3,6 @@ description: "Smart Energy Optimization — solar, battery, EV, surplus dispatch
 version: "2.0.0"
 slug: "carma_box"
 url: "https://github.com/11z4t/carma-box-v2"
-image: "ghcr.io/11z4t/carma-box-{arch}"
 arch:
   - amd64
   - aarch64
