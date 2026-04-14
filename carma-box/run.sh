@@ -12,7 +12,12 @@ if [ ! -f "${SITE_CONFIG}" ]; then
 fi
 
 # Supervisor token → CARMA_HA_TOKEN
-export CARMA_HA_TOKEN="${SUPERVISOR_TOKEN}"
+# Read from s6 container environment file if env var is empty
+if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
+    export CARMA_HA_TOKEN="$(cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null)"
+else
+    export CARMA_HA_TOKEN="${SUPERVISOR_TOKEN}"
+fi
 
 # Log level from add-on config
 LOG_LEVEL=$(bashio::config 'log_level')
