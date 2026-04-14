@@ -4,10 +4,12 @@ FROM ${BUILD_FROM}
 # Base image has Python 3.12. Install git for clone.
 RUN apk add --no-cache git
 
-# Clone application from GitHub
+# Clone application from GitHub (cache-bust via BUILD_DATE)
+ARG BUILD_DATE=unknown
 WORKDIR /opt
 RUN git clone --depth 1 --branch master \
-    https://github.com/11z4t/carma-box-v2.git carma-box
+    https://github.com/11z4t/carma-box-v2.git carma-box \
+    && echo "Built: ${BUILD_DATE}"
 
 WORKDIR /opt/carma-box
 
