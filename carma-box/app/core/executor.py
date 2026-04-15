@@ -16,6 +16,7 @@ import itertools
 import logging
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -25,6 +26,9 @@ from core.mode_change import ModeChangeManager
 from core.models import Command, CommandType, EMSMode
 
 logger = logging.getLogger(__name__)
+
+# Entity template for GoodWe grid export limit — configurable per inverter.
+_GOODWE_EXPORT_LIMIT_ENTITY = "number.goodwe_grid_export_limit_{}"
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +142,22 @@ class CommandExecutor:
         self._last_mode_change: dict[str, float] = {}
         # H6: deque with maxlen prevents unbounded memory growth
         self._audit: deque[AuditEntry] = deque(maxlen=self._config.audit_maxlen)
+        # C1 (PLAT-1577): dispatch table — one entry per CommandType, built here
+        # so self._exec_* methods capture self as closure.
+        self._handlers: dict[CommandType, Callable[[Command], Awaitable[bool]]] = {
+            CommandType.SET_EMS_MODE: self._exec_set_ems_mode,
+            CommandType.SET_EMS_POWER_LIMIT: self._exec_set_ems_power_limit,
+            CommandType.SET_FAST_CHARGING: self._exec_set_fast_charging,
+            CommandType.SET_EV_CURRENT: self._exec_set_ev_current,
+            CommandType.START_EV_CHARGING: self._exec_start_ev,
+            CommandType.STOP_EV_CHARGING: self._exec_stop_ev,
+            CommandType.TURN_ON_CONSUMER: self._exec_consumer_on,
+            CommandType.TURN_OFF_CONSUMER: self._exec_consumer_off,
+            CommandType.CLIMATE_SET_TEMP: self._exec_climate_set_temp,
+            CommandType.CLIMATE_SET_MODE: self._exec_climate_set_mode,
+            CommandType.SET_EXPORT_LIMIT: self._exec_set_export_limit,
+            CommandType.NO_OP: self._exec_no_op,
+        }
 
     async def execute(self, commands: list[Command]) -> ExecutionResult:
         """Execute a list of commands from a CycleDecision.
@@ -219,34 +239,14 @@ class CommandExecutor:
     # ------------------------------------------------------------------
 
     async def _dispatch(self, cmd: Command) -> bool:
-        """Route a command to the appropriate adapter.
+        """Route a command to the appropriate adapter via dispatch table.
 
         Returns True on success, False on failure. Never raises.
+        The dispatch table (self._handlers) covers every CommandType value;
+        test_dispatch_table_contains_all_command_types enforces completeness.
         """
         try:
-            if cmd.command_type == CommandType.SET_EMS_MODE:
-                return await self._exec_set_ems_mode(cmd)
-            elif cmd.command_type == CommandType.SET_EMS_POWER_LIMIT:
-                return await self._exec_set_ems_power_limit(cmd)
-            elif cmd.command_type == CommandType.SET_FAST_CHARGING:
-                return await self._exec_set_fast_charging(cmd)
-            elif cmd.command_type == CommandType.SET_EV_CURRENT:
-                return await self._exec_set_ev_current(cmd)
-            elif cmd.command_type == CommandType.START_EV_CHARGING:
-                return await self._exec_start_ev(cmd)
-            elif cmd.command_type == CommandType.STOP_EV_CHARGING:
-                return await self._exec_stop_ev(cmd)
-            elif cmd.command_type == CommandType.TURN_ON_CONSUMER:
-                return await self._exec_consumer_on(cmd)
-            elif cmd.command_type == CommandType.TURN_OFF_CONSUMER:
-                return await self._exec_consumer_off(cmd)
-            elif cmd.command_type == CommandType.CLIMATE_SET_TEMP:
-                return await self._exec_climate_set_temp(cmd)
-            elif cmd.command_type == CommandType.CLIMATE_SET_MODE:
-                return await self._exec_climate_set_mode(cmd)
-            else:
-                logger.warning("Unknown command type: %s", cmd.command_type)
-                return False
+            return await self._handlers[cmd.command_type](cmd)
         except Exception as exc:
             logger.error(
                 "Command execution failed: %s %s → %s",
@@ -335,6 +335,46 @@ class CommandExecutor:
             logger.error("No consumer for %s", cmd.target_id)
             return False
         return await consumer.turn_off()
+
+    # ------------------------------------------------------------------
+    # Stub commands (C4 PLAT-1577: no adapter registered yet)
+    # ------------------------------------------------------------------
+
+    async def _exec_set_export_limit(self, cmd: Command) -> bool:
+        """SET_EXPORT_LIMIT: write grid export limit via HA number entity."""
+        inverter = self._inverters.get(cmd.target_id)
+        if not inverter:
+            logger.error("No inverter for export limit %s", cmd.target_id)
+            return False
+        limit_w = int(cmd.value or 0)
+        entity_id = _GOODWE_EXPORT_LIMIT_ENTITY.format(cmd.target_id)
+        logger.info(
+            "Setting export limit → %d W on %s", limit_w, cmd.target_id,
+        )
+        try:
+            # Use set_ems_power_limit as proxy — writes to number entity.
+            # Export limit entity naming follows same pattern.
+            api = getattr(inverter, "_api", None)
+            if api is None:
+                logger.error("No API on inverter %s", cmd.target_id)
+                return False
+            result: bool = await api.call_service(
+                "number", "set_value",
+                {"entity_id": entity_id, "value": limit_w},
+            )
+            return result
+        except Exception as exc:
+            logger.error("Export limit write failed: %s", exc)
+            return False
+
+    async def _exec_no_op(self, cmd: Command) -> bool:
+        """NO_OP: pre-filtered by execute() and never reaches dispatch in normal flow.
+
+        Registered in the dispatch table so that
+        test_dispatch_table_contains_all_command_types passes for every
+        CommandType member.  Returns True (vacuously successful).
+        """
+        return True
 
     async def _exec_climate_set_temp(self, cmd: Command) -> bool:
         """Set climate entity temperature via HA service."""
