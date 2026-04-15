@@ -1,1 +1,0 @@
-"""CARMA Box configuration package."""

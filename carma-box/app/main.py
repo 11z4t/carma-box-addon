@@ -25,9 +25,12 @@ import aiohttp.web
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+from adapters.easee import EaseeAdapter
+from adapters.solcast import SolcastAdapter
 from adapters.goodwe import GoodWeAdapter
+from adapters.shelly import ShellyAdapter
 from adapters.ha_api import HAApiClient
 from config.schema import CarmaConfig, load_config
 from core.balancer import BalancerConfig, BatteryBalancer
@@ -48,8 +51,16 @@ from core.models import (
     SystemSnapshot,
 )
 from core.ellevio import EllevioConfig, EllevioTracker
+from core.day_plan import DayPlan, HourlyForecast
+from core.day_planner import (
+    BatteryPlanConfig,
+    DayPlanConfig,
+    EVPlanConfig,
+    generate_day_plan,
+)
 from core.planner import Planner, PlannerConfig
 from core.ev_controller import EVAction, EVController, EVControllerConfig
+from core.ev_surplus import EVSurplusConfig, EVSurplusController
 from core.surplus_dispatch import SurplusConfig as SurplusDispatchConfig, SurplusDispatch
 from health import HealthStatus, Metrics
 from core.state_machine import StateMachine, StateMachineConfig
@@ -62,6 +73,19 @@ logger = logging.getLogger("carma_box")
 # Conversion constants — no naked numeric literals in business logic.
 _W_TO_KW: float = 1000.0
 _MS_PER_S: int = 1000
+_PCT_TO_RATIO: float = 100.0
+
+# DayPlan generation fallback constants (PLAT-1627)
+_DEFAULT_SOC_PCT: float = 50.0
+_PV_P10_RATIO: float = 0.7
+_PV_P90_RATIO: float = 1.3
+_DEFAULT_BASELOAD_KW: float = 2.5
+_DAYLIGHT_HOURS: int = 12
+_FALLBACK_WINDOW_START_H: int = 6
+_FALLBACK_WINDOW_END_H: int = 22
+_PV_REPLAN_FALLBACK_THRESHOLD: float = 0.20
+_DYNAMIC_TAK_DEFAULT_KW: float = 3.0
+_PRICE_DEFAULT_ORE: float = 100.0
 
 
 def setup_logging(config: CarmaConfig) -> None:
@@ -130,6 +154,8 @@ class CarmaBoxService:
         self._ha_api = ha_api
         self._last_plan_hour: int = -1
         self._last_pv_tomorrow: float = -1.0
+        # DayPlan: set by generate_day_plan(), read by dashboard sensor (PLAT-1627)
+        self._current_day_plan: Optional[Any] = None
 
         # Create components only when HA API is available
         if ha_api is not None:
@@ -142,6 +168,7 @@ class CarmaBoxService:
             self._planner: Optional[Planner] = None
             self._ellevio: Optional[EllevioTracker] = None
             self._ev_controller: Optional[EVController] = None
+            self._solcast: Optional[SolcastAdapter] = None
             self._consumer_configs = config.consumers
             # Dry-run: create PlanExecutor with minimal deps for generate_48h
             _dry_planner = Planner(PlannerConfig())
@@ -205,6 +232,36 @@ class CarmaBoxService:
             set_wait_s=float(config.control.mode_change_set_wait_s),
             verify_wait_s=float(config.control.mode_change_verify_wait_s),
         ))
+        # EV charger adapter — wired into executor for EV commands
+        ev_adapter: Optional[EaseeAdapter] = None
+        if config.ev_charger and config.ev_charger.charger_id:
+            ev_adapter = EaseeAdapter(
+                ha_api=ha_api,
+                config=config.ev_charger,
+            )
+            logger.info(
+                "EaseeAdapter wired: charger_id=%s",
+                config.ev_charger.charger_id,
+            )
+
+        # Dispatchable consumers — ShellyAdapter per consumer in config
+        from core.executor import LoadPort
+        consumers: dict[str, LoadPort] = {}
+        for consumer_cfg in config.consumers:
+            if consumer_cfg.entity_switch:
+                consumers[consumer_cfg.id] = ShellyAdapter(
+                    ha_api=ha_api,
+                    consumer_id=consumer_cfg.id,
+                    entity_switch=consumer_cfg.entity_switch,
+                    entity_power=consumer_cfg.entity_power,
+                    load_type_str=consumer_cfg.type,
+                )
+        if consumers:
+            logger.info(
+                "ShellyAdapters wired: %s",
+                ", ".join(consumers.keys()),
+            )
+
         executor = CommandExecutor(
             inverters=dict(inverters),
             mode_manager=mode_mgr,
@@ -212,6 +269,8 @@ class CarmaBoxService:
                 mode_change_cooldown_s=config.control.mode_change_cooldown_s,
             ),
             ha_api=ha_api,
+            ev_charger=ev_adapter,
+            consumers=consumers,
         )
 
         # Slack notifier
@@ -238,6 +297,16 @@ class CarmaBoxService:
             config=config,
             guard_policy=guard_policy,
         )
+
+        # Solcast adapter — hourly PV forecast for DayPlan (PLAT-1659)
+        self._solcast = None
+        if config.pv_forecast.entity_today:
+            self._solcast = SolcastAdapter(
+                ha_api=ha_api,
+                entity_today=config.pv_forecast.entity_today,
+                entity_tomorrow=config.pv_forecast.entity_tomorrow,
+            )
+            logger.info("SolcastAdapter wired: %s", config.pv_forecast.entity_today)
 
         # Ellevio peak tracker
         self._ellevio = EllevioTracker(EllevioConfig(
@@ -267,12 +336,32 @@ class CarmaBoxService:
         ))
         self._consumer_configs = config.consumers
 
+        # EV surplus controller — PV-only EV charging with ramp
+        ev_surplus_ctrl: Optional[EVSurplusController] = None
+        if ev_adapter is not None:
+            ev_ramp = config.ev_charger.ramp
+            ev_surplus_ctrl = EVSurplusController(EVSurplusConfig(
+                min_amps=config.ev_charger.min_amps,
+                max_amps=config.ev_charger.max_amps,
+                phases=config.ev_charger.phases,
+                voltage_v=config.ev_charger.voltage_v,
+                step_amps=ev_ramp.step_amps,
+            ))
+            logger.info(
+                "EVSurplusController wired: %d-%dA, %d-phase",
+                config.ev_charger.min_amps,
+                config.ev_charger.max_amps,
+                config.ev_charger.phases,
+            )
+
         # H2: map battery_id → config so engine can read per-battery limits
         battery_cfg_map = {bc.id: bc for bc in config.batteries}
 
         self._engine = ControlEngine(
             grid_guard, sm, balancer, mode_mgr, executor,
             battery_configs=battery_cfg_map,
+            ev_surplus=ev_surplus_ctrl,
+            surplus_dispatch=self._surplus_dispatch,
         )
 
     @property
@@ -374,7 +463,7 @@ class CarmaBoxService:
             delta_pct = abs(pv_tomorrow - self._last_pv_tomorrow) / self._last_pv_tomorrow
             replan_threshold = (
                 self._planner._config.pv_replan_threshold
-                if self._planner else 0.2
+                if self._planner else _PV_REPLAN_FALLBACK_THRESHOLD
             )
             if delta_pct > replan_threshold:
                 pv_changed = True
@@ -405,6 +494,12 @@ class CarmaBoxService:
             self._last_plan_hour = snapshot.hour
             is_forced = startup_replan or force_replan
             await self._plan_executor.generate(snapshot, force=is_forced)
+
+            # Generate DayPlan for dashboard sensor (PLAT-1627)
+            try:
+                self._current_day_plan = await self._generate_day_plan(snapshot)
+            except Exception as exc:
+                logger.warning("DayPlan generation skipped: %s", exc)
 
         # Phase 1.5: ELLEVIO TRACKING — update weighted hourly average
         if self._ellevio:
@@ -542,6 +637,69 @@ class CarmaBoxService:
         if task.exception():
             logger.error("Health server failed: %s", task.exception())
 
+    async def _generate_day_plan(self, snapshot: SystemSnapshot) -> Optional[DayPlan]:
+        """Generate DayPlan from current state + Solcast forecast.
+
+        PLAT-1627: Creates DayPlan for dashboard sensor and Excel report.
+        Returns None if insufficient data.
+        """
+        cfg = self._config
+        batteries = tuple(
+            BatteryPlanConfig(
+                battery_id=bat_cfg.id,
+                cap_kwh=bat_cfg.cap_kwh,
+                max_charge_kw=bat_cfg.max_charge_kw,
+                efficiency=bat_cfg.efficiency,
+                min_soc_pct=bat_cfg.min_soc_pct,
+                current_soc_pct=next(
+                    (b.soc_pct for b in snapshot.batteries if b.battery_id == bat_cfg.id),
+                    _DEFAULT_SOC_PCT,
+                ),
+            )
+            for bat_cfg in cfg.batteries
+        )
+        ev = EVPlanConfig(
+            min_amps=cfg.ev_charger.min_amps,
+            max_amps=cfg.ev_charger.max_amps,
+            phases=cfg.ev_charger.phases,
+            voltage_v=cfg.ev_charger.voltage_v,
+            current_soc_pct=snapshot.ev.soc_pct,
+            target_soc_pct=snapshot.ev.target_soc_pct,
+            battery_kwh=cfg.ev.battery_kwh,
+            efficiency=cfg.ev.efficiency,
+            connected=snapshot.ev.connected,
+        )
+        # Build hourly PV forecast from Solcast adapter (PLAT-1659)
+        pv_hourly: dict[int, HourlyForecast] = {}
+        if self._solcast:
+            try:
+                pv_hourly = await self._solcast.get_hourly_forecast(snapshot.hour)
+            except Exception as exc:
+                logger.debug("Solcast hourly fetch skipped: %s", exc)
+        if not pv_hourly:
+            # Fallback: flat distribution of daily total
+            total = snapshot.grid.pv_forecast_today_kwh
+            per_hour = total / _DAYLIGHT_HOURS if total > 0 else 0.0
+            pv_hourly = {
+                h: HourlyForecast(
+                    p10_kwh=per_hour * _PV_P10_RATIO,
+                    p50_kwh=per_hour,
+                    p90_kwh=per_hour * _PV_P90_RATIO,
+                )
+                for h in range(_FALLBACK_WINDOW_START_H, _FALLBACK_WINDOW_END_H)
+            }
+
+        plan_cfg = DayPlanConfig(
+            batteries=batteries,
+            ev=ev,
+            baseload_kw=cfg.night_plan.house_baseload_kw if self._planner else _DEFAULT_BASELOAD_KW,
+        )
+        try:
+            return generate_day_plan(pv_hourly, plan_cfg)
+        except Exception as exc:
+            logger.error("DayPlan generation failed: %s", exc)
+            return None
+
     @staticmethod
     def _entity_domain(entity_id: str) -> str:
         """Extract domain from entity_id (e.g. 'switch.x' → 'switch')."""
@@ -625,7 +783,8 @@ class CarmaBoxService:
                         )
 
                 floor = cfg.guards.g1_soc_floor.floor_pct  # From site.yaml
-                avail = max(0.0, (soc - floor) / 100.0 * bat_cfg.cap_kwh * bat_cfg.efficiency)
+                soc_ratio = (soc - floor) / _PCT_TO_RATIO
+                avail = max(0.0, soc_ratio * bat_cfg.cap_kwh * bat_cfg.efficiency)
 
                 batteries.append(BatteryState(
                     battery_id=bat_cfg.id,
@@ -708,9 +867,9 @@ class CarmaBoxService:
                 grid_power_w=batteries[0].grid_power_w if batteries else 0.0,
                 weighted_avg_kw=_grid_float(grid_ents.entity_weighted_avg),
                 current_peak_kw=_grid_float(grid_ents.entity_current_peak),
-                dynamic_tak_kw=_grid_float(grid_ents.entity_dynamic_tak, 3.0),
+                dynamic_tak_kw=_grid_float(grid_ents.entity_dynamic_tak, _DYNAMIC_TAK_DEFAULT_KW),
                 pv_total_w=pv_total,
-                price_ore=_grid_float(cfg.pricing.entity, 100.0) * 100,
+                price_ore=_grid_float(cfg.pricing.entity, _PRICE_DEFAULT_ORE) * _PCT_TO_RATIO,
                 pv_forecast_today_kwh=_grid_float(cfg.pv_forecast.entity_today),
                 pv_forecast_tomorrow_kwh=_grid_float(cfg.pv_forecast.entity_tomorrow),
             )
@@ -1199,6 +1358,31 @@ class CarmaBoxService:
                 "turn_on" if pv_tomorrow >= pv_high_threshold else "turn_off",
                 {"entity_id": pv_high_tomorrow_entity},
         )
+
+        # DayPlan sensor — write current day plan (PLAT-1627)
+        # LÄRDOM [dead-code-guard]: always init in __init__, never use hasattr()
+        if self._current_day_plan is not None:
+            plan = self._current_day_plan
+            current_slot = plan.get_slot(snapshot.hour)
+            plan_state = "active" if current_slot else "no_slot"
+            plan_attrs: dict[str, object] = {
+                "friendly_name": "CARMA Box Day Plan",
+                "slots": plan.to_dict()["slots"],
+                "can_discharge_fm": plan.can_discharge_fm,
+                "total_expected_export_kwh": round(
+                    plan.total_expected_export_kwh, 2,
+                ),
+                "bat_target_soc_pct": plan.bat_target_soc_pct,
+                "ev_target_soc_pct": plan.ev_target_soc_pct,
+                "created_at": plan.to_dict()["created_at"],
+            }
+            if current_slot:
+                plan_attrs["current_hour"] = current_slot.to_dict()
+            await self._ha_api.set_state(
+                "sensor.carma_box_day_plan",
+                plan_state,
+                plan_attrs,
+            )
 
         # Ellevio sensor — write peak tracking data
         if self._ellevio:

@@ -23,6 +23,7 @@ from typing import Optional
 
 from config.schema import BatteryConfig
 from core.balancer import BalanceResult, BatteryBalancer, BatteryInfo
+from core.ev_surplus import EVSurplusController
 from core.executor import CommandExecutor, ExecutionResult
 from core.guards import GridGuard, GuardEvaluation, GuardLevel
 from core.mode_change import ModeChangeManager
@@ -36,6 +37,7 @@ from core.models import (
     SystemSnapshot,
 )
 from core.state_machine import StateMachine
+from core.surplus_dispatch import SurplusDispatch
 from storage.session_tracker import EV_EVENT_START, EV_EVENT_STOP, EnergySessionTracker
 
 logger = logging.getLogger(__name__)
@@ -113,6 +115,8 @@ class ControlEngine:
         executor: CommandExecutor,
         battery_configs: Optional[dict[str, BatteryConfig]] = None,
         session_tracker: Optional[EnergySessionTracker] = None,
+        ev_surplus: Optional[EVSurplusController] = None,
+        surplus_dispatch: Optional[SurplusDispatch] = None,
     ) -> None:
         self._guard = guard
         self._sm = state_machine
@@ -122,6 +126,8 @@ class ControlEngine:
         # H2: per-battery capacity limits sourced from config (not hardcoded)
         self._battery_configs: dict[str, BatteryConfig] = battery_configs or {}
         self._session_tracker = session_tracker
+        self._ev_surplus = ev_surplus
+        self._surplus_dispatch = surplus_dispatch
         self._last_ev_charging: Optional[bool] = None
         self._cycle_count = 0
         self._last_plan_time = 0.0
@@ -353,6 +359,7 @@ class ControlEngine:
     _GRID_HYSTERESIS_W: float = 100.0  # Accept <100W import/export
     _SOC_BALANCE_LOWER_RATIO: float = 0.75  # Lower SoC bat gets 75%
     _SOC_BALANCE_HIGHER_RATIO: float = 0.25  # Higher SoC bat gets 25%
+    _BALANCE_DISCHARGE_RATE_W: int = 500  # Active balancing discharge rate for higher-SoC bat
     _MIN_MODE_DWELL_CYCLES: int = 2  # Stay in mode at least 2 cycles (60s)
 
     async def _compute_charge_plan(
@@ -404,7 +411,7 @@ class ControlEngine:
             b for b in snapshot.batteries if b.soc_pct < MAX_SOC_PCT
         ]
         if not active_bats:
-            # All full — standby all
+            # All full — standby all, then route surplus to EV/dispatch
             cmds: list[Command] = []
             for bat in snapshot.batteries:
                 if bat.ems_mode.value != EMSMode.BATTERY_STANDBY.value:
@@ -415,24 +422,40 @@ class ControlEngine:
                         rule_id="PV_CHARGE_PLAN",
                         reason="SoC 100% → standby",
                     ))
+
+            # Bat full → route remaining surplus to EV then dispatch
+            ev_cmds = self._ev_surplus_evaluate(
+                available_surplus_w, house_grid_power_w, snapshot,
+            )
+            cmds.extend(ev_cmds)
+
+            ev_w_full: int = 0
+            if self._ev_surplus and self._ev_surplus.is_charging:
+                ev_w_full = int(
+                    self._ev_surplus.current_amps * self._ev_surplus._cfg.w_per_amp
+                )
+            dispatch_surplus = max(0, available_surplus_w - ev_w_full)
+            dispatch_cmds = self._dispatch_evaluate(dispatch_surplus, snapshot)
+            cmds.extend(dispatch_cmds)
+
             if cmds:
                 return await self._executor.execute(cmds)
             return None
 
+        discharge_ids: set[str] = set()
         if len(active_bats) == _DUAL_BATTERY_COUNT:
             ids = [b.battery_id for b in active_bats]
             soc_diff = abs(bat_socs[ids[0]] - bat_socs[ids[1]])
 
             if soc_diff > self._SOC_BALANCE_THRESHOLD_PCT:
-                # Unbalanced — more power to lower SoC
+                # Unbalanced — charge lower SoC, actively discharge higher SoC
                 lower_id = (
                     ids[0] if bat_socs[ids[0]] < bat_socs[ids[1]]
                     else ids[1]
                 )
                 higher_id = ids[1] if lower_id == ids[0] else ids[0]
-                # 75% to lower, 25% to higher
-                allocations[lower_id] = int(available_surplus_w * self._SOC_BALANCE_LOWER_RATIO)
-                allocations[higher_id] = int(available_surplus_w * self._SOC_BALANCE_HIGHER_RATIO)
+                allocations[lower_id] = available_surplus_w  # 100% to lower
+                discharge_ids.add(higher_id)  # Higher SoC → active discharge
             else:
                 # Balanced — proportional by capacity
                 for bid in ids:
@@ -446,7 +469,26 @@ class ControlEngine:
         for bat in snapshot.batteries:
             limit_w = allocations.get(bat.battery_id, 0)
 
-            if limit_w > 0:
+            if bat.battery_id in discharge_ids:
+                # Active SoC balancing: discharge higher-SoC bat at fixed rate
+                cmds.append(Command(
+                    command_type=CommandType.SET_EMS_MODE,
+                    target_id=bat.battery_id,
+                    value=EMSMode.DISCHARGE_PV.value,
+                    rule_id='PV_CHARGE_PLAN',
+                    reason=(
+                        f'SoC imbalance: {bat.battery_id}'
+                        f' (soc={bat.soc_pct:.0f}%) → discharge_pv balance'
+                    ),
+                ))
+                cmds.append(Command(
+                    command_type=CommandType.SET_EMS_POWER_LIMIT,
+                    target_id=bat.battery_id,
+                    value=self._BALANCE_DISCHARGE_RATE_W,
+                    rule_id='PV_CHARGE_PLAN',
+                    reason=f'Active balance: limit={self._BALANCE_DISCHARGE_RATE_W}W',
+                ))
+            elif limit_w > 0:
                 # charge_battery with PV surplus limit
                 if bat.ems_mode.value != EMSMode.CHARGE_BATTERY.value:
                     cmds.append(Command(
@@ -491,16 +533,91 @@ class ControlEngine:
                             reason="Standby: restore export_limit",
                         ))
 
+        # After bat allocation, check if surplus remains for EV + dispatch
+        bat_allocated = sum(allocations.values())
+        remaining_surplus = max(0, available_surplus_w - bat_allocated)
+
+        if remaining_surplus > 0:
+            ev_cmds = self._ev_surplus_evaluate(
+                remaining_surplus, house_grid_power_w, snapshot,
+            )
+            cmds.extend(ev_cmds)
+
+            # Subtract EV consumption from remaining for dispatch
+            ev_consume_w: int = 0
+            if self._ev_surplus and self._ev_surplus.is_charging:
+                ev_consume_w = int(
+                    self._ev_surplus.current_amps * self._ev_surplus._cfg.w_per_amp
+                )
+            dispatch_surplus = max(0, remaining_surplus - int(ev_consume_w))
+            dispatch_cmds = self._dispatch_evaluate(dispatch_surplus, snapshot)
+            cmds.extend(dispatch_cmds)
+
         if cmds:
             exec_result = await self._executor.execute(cmds)
             logger.info(
-                "PV CHARGE PLAN: surplus=%dW grid=%dW alloc=%s",
+                "PV CHARGE PLAN: surplus=%dW grid=%dW alloc=%s ev=%s",
                 available_surplus_w,
                 int(house_grid_power_w),
                 {k: f"{v}W" for k, v in allocations.items()},
+                (f"{self._ev_surplus.current_amps}A"
+                 if self._ev_surplus and self._ev_surplus.is_charging
+                 else "off"),
             )
             return exec_result
         return None
+
+    # ------------------------------------------------------------------
+    # EV Surplus + Dispatch helpers
+    # ------------------------------------------------------------------
+
+    def _ev_surplus_evaluate(
+        self,
+        surplus_w: int,
+        grid_power_w: float,
+        snapshot: SystemSnapshot,
+    ) -> list[Command]:
+        """Evaluate EV surplus charging if controller is configured."""
+        if not self._ev_surplus:
+            return []
+        return self._ev_surplus.evaluate(
+            surplus_w=float(surplus_w),
+            grid_power_w=grid_power_w,
+            ev_connected=snapshot.ev.connected,
+            ev_soc_pct=snapshot.ev.soc_pct,
+            ev_target_soc_pct=snapshot.ev.target_soc_pct,
+        )
+
+    def _dispatch_evaluate(
+        self, surplus_w: int, snapshot: Optional[SystemSnapshot] = None,
+    ) -> list[Command]:
+        """Evaluate surplus dispatch if controller is configured.
+
+        Converts SurplusResult allocations to Command objects.
+        """
+        if not self._surplus_dispatch or snapshot is None:
+            return []
+        consumers = list(snapshot.consumers)
+        result = self._surplus_dispatch.evaluate(float(surplus_w), consumers)
+        cmds: list[Command] = []
+        for alloc in result.allocations:
+            if alloc.action == "start":
+                cmds.append(Command(
+                    command_type=CommandType.TURN_ON_CONSUMER,
+                    target_id=alloc.consumer_id,
+                    value=None,
+                    rule_id="PV_SURPLUS_DISPATCH",
+                    reason=alloc.reason,
+                ))
+            elif alloc.action == "stop":
+                cmds.append(Command(
+                    command_type=CommandType.TURN_OFF_CONSUMER,
+                    target_id=alloc.consumer_id,
+                    value=None,
+                    rule_id="PV_SURPLUS_DISPATCH",
+                    reason=alloc.reason,
+                ))
+        return cmds
 
     @property
     def cycle_count(self) -> int:
