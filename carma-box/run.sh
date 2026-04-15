@@ -22,7 +22,8 @@ fi
 # Log level from add-on config
 LOG_LEVEL=$(bashio::config 'log_level')
 
-bashio::log.info "CARMA Box v2.0.0 starting"
+ADDON_VERSION=$(bashio::addon.version)
+bashio::log.info "CARMA Box v${ADDON_VERSION} starting"
 bashio::log.info "Config: ${SITE_CONFIG}"
 
 cd /opt/carma-box
