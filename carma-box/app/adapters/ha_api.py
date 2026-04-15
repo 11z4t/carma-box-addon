@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import time
+from http import HTTPStatus
 from typing import Any, Optional
 
 import aiohttp
@@ -24,6 +25,19 @@ logger = logging.getLogger(__name__)
 # All adapters sharing the client will reuse this within the same cycle.
 _DEFAULT_BATCH_CACHE_TTL_S: float = 25.0
 _DEFAULT_INPUT_TEXT_MAX_LEN: int = 255
+_HA_CONNECTOR_POOL_SIZE: int = 10
+
+# PLAT-1573: Public constants for callers and tests.
+HA_API_TIMEOUT_S: int = 10
+HA_API_BATCH_SIZE: int = 50
+
+# PLAT-1574: Named timeout/body constants (no magic numbers in logic code).
+HA_API_BATCH_TIMEOUT_S: int = 30
+_ERROR_BODY_MAX_LEN: int = 200
+
+# PLAT-1575: Exponential backoff constants (B2/B3).
+HA_API_BACKOFF_BASE: int = 2
+HA_API_MAX_BACKOFF_S: int = 30
 
 
 class HAApiClient:
@@ -44,19 +58,21 @@ class HAApiClient:
         self._retry_count = config.retry_count
         self._retry_delay_s = config.retry_delay_s
         self._batch_cache_ttl_s = getattr(
-            config, "batch_cache_ttl_s", _DEFAULT_BATCH_CACHE_TTL_S,
+            config,
+            "batch_cache_ttl_s",
+            _DEFAULT_BATCH_CACHE_TTL_S,
         )
         self._input_text_max_len = getattr(
-            config, "input_text_max_len", _DEFAULT_INPUT_TEXT_MAX_LEN,
+            config,
+            "input_text_max_len",
+            _DEFAULT_INPUT_TEXT_MAX_LEN,
         )
         self._session: Optional[aiohttp.ClientSession] = None
 
         # Resolve token from environment
         token = os.environ.get(config.token_env, "")
         if not token:
-            logger.warning(
-                "HA token environment variable %s is empty", config.token_env
-            )
+            logger.warning("HA token environment variable %s is empty", config.token_env)
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -74,7 +90,7 @@ class HAApiClient:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
                 ssl=self._config.verify_ssl,
-                limit=10,
+                limit=_HA_CONNECTOR_POOL_SIZE,
             )
             self._session = aiohttp.ClientSession(
                 headers=self._headers,
@@ -84,20 +100,24 @@ class HAApiClient:
         return self._session
 
     # PLAT-1354: status codes that must never be retried
-    _NO_RETRY_STATUSES: frozenset[int] = frozenset({401, 403, 404})
+    _NO_RETRY_STATUSES: frozenset[int] = frozenset({
+        HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN, HTTPStatus.NOT_FOUND,
+    })
 
     async def _request(
         self,
         method: str,
         path: str,
         json_data: Optional[dict[str, Any]] = None,
+        *,
+        timeout: Optional[aiohttp.ClientTimeout] = None,
     ) -> Optional[Any]:
         """Execute an HTTP request with retry logic.
 
         Returns parsed JSON on success, None on failure after all retries.
 
-        PLAT-1354: 401/403 auth errors are never retried — retrying won't fix
-        a bad token. 404 is also never retried (entity doesn't exist).
+        PLAT-1354: Auth errors (UNAUTHORIZED/FORBIDDEN) are never retried —
+        retrying won't fix a bad token. NOT_FOUND is also never retried.
         """
         url = f"{self._base_url}{path}"
         last_error: Optional[Exception] = None
@@ -106,19 +126,21 @@ class HAApiClient:
             try:
                 session = await self._ensure_session()
                 async with session.request(
-                    method, url, json=json_data
+                    method, url, json=json_data, timeout=timeout
                 ) as resp:
-                    if resp.status == 200:
+                    if resp.status == HTTPStatus.OK:
                         return await resp.json()
                     # PLAT-1354: auth errors and 404 must never be retried
                     if resp.status in self._NO_RETRY_STATUSES:
-                        if resp.status in (401, 403):
+                        if resp.status != HTTPStatus.NOT_FOUND:
                             logger.error(
                                 "HA API %s %s auth error %d — check token (not retrying)",
-                                method, path, resp.status,
+                                method,
+                                path,
+                                resp.status,
                             )
                         else:
-                            logger.debug("404 for %s", path)
+                            logger.debug("HTTP %s for %s", HTTPStatus.NOT_FOUND, path)
                         return None
                     # Server error — retry
                     body = await resp.text()
@@ -126,7 +148,7 @@ class HAApiClient:
                         request_info=resp.request_info,
                         history=resp.history,
                         status=resp.status,
-                        message=body[:200],
+                        message=body[:_ERROR_BODY_MAX_LEN],
                     )
                     logger.warning(
                         "HA API %s %s returned %d (attempt %d/%d)",
@@ -152,7 +174,15 @@ class HAApiClient:
                 )
 
             if attempt < self._retry_count:
-                await asyncio.sleep(self._retry_delay_s)
+                sleep_s = min(
+                    self._retry_delay_s * (HA_API_BACKOFF_BASE ** (attempt - 1)),
+                    HA_API_MAX_BACKOFF_S,
+                )
+                logger.debug(
+                    "Retry %d/%d in %.1fs (backoff)",
+                    attempt, self._retry_count, sleep_s,
+                )
+                await asyncio.sleep(sleep_s)
 
         logger.error(
             "HA API %s %s failed after %d retries: %s",
@@ -182,9 +212,7 @@ class HAApiClient:
             return None
         return state
 
-    async def get_state_with_attributes(
-        self, entity_id: str
-    ) -> Optional[dict[str, Any]]:
+    async def get_state_with_attributes(self, entity_id: str) -> Optional[dict[str, Any]]:
         """Get full state dict (state + attributes) for a single entity.
 
         Returns {"state": "...", "attributes": {...}, ...} or None.
@@ -195,16 +223,14 @@ class HAApiClient:
         result: dict[str, Any] = data
         return result
 
-    async def get_states_batch(
-        self, entity_ids: list[str]
-    ) -> dict[str, Any]:
+    async def get_states_batch(self, entity_ids: list[str]) -> dict[str, Any]:
         """Read multiple entity states in a single API call.
 
         Fetches all states from /api/states and filters client-side
         to only return the requested entities.
 
         H5: The full-state response is cached for _BATCH_CACHE_TTL_S seconds
-        so that multiple adapters calling this within the same 30-second cycle
+        so that multiple adapters calling this within the same control cycle
         share one HTTP round-trip instead of each issuing their own request.
 
         Returns a dict mapping entity_id -> full state dict.
@@ -219,9 +245,23 @@ class HAApiClient:
             now = time.monotonic()
             age = now - self._batch_cache_ts
             if self._batch_cache is None or age >= self._batch_cache_ttl_s:
-                all_states = await self._request("GET", "/api/states")
+                batch_timeout = aiohttp.ClientTimeout(total=HA_API_BATCH_TIMEOUT_S)
+                all_states = await self._request(
+                    "GET", "/api/states", timeout=batch_timeout
+                )
                 if all_states is None:
-                    return {}
+                    # AC3: Graceful degradation — fall back to per-entity requests
+                    logger.warning(
+                        "Batch /api/states failed — falling back to per-entity "
+                        "fetch for %d entities",
+                        len(entity_ids),
+                    )
+                    per_entity: dict[str, Any] = {}
+                    for eid in entity_ids:
+                        data = await self._request("GET", f"/api/states/{eid}")
+                        if data is not None:
+                            per_entity[eid] = data
+                    return per_entity
                 self._batch_cache = all_states
                 self._batch_cache_ts = now
                 logger.debug("H5: batch cache refreshed (age=%.1fs)", age)
@@ -271,7 +311,9 @@ class HAApiClient:
         if isinstance(result, dict) and "message" in result:
             logger.warning(
                 "HA service %s/%s returned error: %s",
-                domain, service, result.get("message", ""),
+                domain,
+                service,
+                result.get("message", ""),
             )
             return False
         return True
@@ -310,8 +352,9 @@ class HAApiClient:
         """
         domain = entity_id.split(".")[0] if "." in entity_id else "input_text"
         return await self.call_service(
-            domain, "set_value",
-            {"entity_id": entity_id, "value": value[:self._input_text_max_len]},
+            domain,
+            "set_value",
+            {"entity_id": entity_id, "value": value[: self._input_text_max_len]},
         )
 
     async def health_check(self) -> bool:
@@ -323,7 +366,7 @@ class HAApiClient:
             session = await self._ensure_session()
             url = f"{self._base_url}/api/"
             async with session.get(url) as resp:
-                return resp.status == 200
+                return resp.status == HTTPStatus.OK
         except Exception:
             return False
 
