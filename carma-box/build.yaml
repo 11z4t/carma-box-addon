@@ -3,4 +3,4 @@ build_from:
   aarch64: "ghcr.io/home-assistant/aarch64-base-python:3.12-alpine3.19"
 args:
   BUILD_DATE: "2026-04-17T18:00"
-  CARMA_VERSION: "2.11.2"
+  CARMA_VERSION: "2.11.3"

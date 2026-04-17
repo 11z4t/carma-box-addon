@@ -220,6 +220,10 @@ def allocate(
         and bat_avg_soc > cfg.bat_discharge_min_soc_pct
     ):
         # Evening discharge 17-20: bat covers house load, grid target 0W
+        logger.info(
+            "EVENING_DISCHARGE match: h=%d bat_avg=%.1f%% bat_full=%s",
+            hour, bat_avg_soc, _all_bat_full(inp, cfg),
+        )
         bat_discharge, bat_alloc = _allocate_evening_discharge(
             inp, cfg, state,
         )
@@ -231,6 +235,13 @@ def allocate(
 
     elif hour >= cfg.evening_cutoff_h:
         # Evening 20-22: bat standby, NO EV (preserve for morning)
+        logger.info(
+            "EVENING standby (not discharge): h=%d bat_avg=%.1f%% "
+            "bat_full=%s bat_min=%.1f cutoff=%d discharge_window=%d-%d",
+            hour, bat_avg_soc, _all_bat_full(inp, cfg),
+            cfg.bat_discharge_min_soc_pct, cfg.evening_cutoff_h,
+            _EVENING_DISCHARGE_START_H, _EVENING_DISCHARGE_END_H,
+        )
         bat_alloc, remaining = _allocate_bat(inp, remaining, cfg)
         ev_target = 0
         reasons.append(f"EVENING: bat {sum(bat_alloc.values())}W, EV off")
