@@ -11,7 +11,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     aiosqlite>=0.19 \
     structlog>=24.1
 
-# Copy application source (no git clone — eliminates Docker cache issues)
+# Copy application source — bust cache on every version bump
+ARG CARMA_VERSION=2.11.2
 COPY app/ /opt/carma-box/
 
 WORKDIR /opt/carma-box
