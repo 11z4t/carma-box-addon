@@ -74,6 +74,10 @@ _DEFAULT_EXPORT_LIMIT_W: int = 5000
 # when battery config is unavailable.
 _SAFE_BAT_FALLBACK_W: float = 5000.0
 
+# PLAT-1674: Min PV surplus for EV FM priority.
+# EV @ 6A 3-phase = 6 × 3 × 230 = 4140W. Surplus must cover FULL EV draw.
+_EV_MIN_SURPLUS_W: float = 4200.0
+
 
 @dataclass
 class CycleResult:
@@ -470,7 +474,8 @@ class ControlEngine:
     # PV Surplus Regulator
     # ------------------------------------------------------------------
 
-    _SOC_BALANCE_THRESHOLD_PCT: float = 2.0  # SoC diff below this = balanced
+    # PLAT-1674: max 1pp SoC spread between kontor/forrad
+    _SOC_BALANCE_THRESHOLD_PCT: float = 1.0
     _GRID_HYSTERESIS_W: float = 100.0  # Accept <100W import/export
     _SOC_BALANCE_LOWER_RATIO: float = 0.75  # Lower SoC bat gets 75%
     _SOC_BALANCE_HIGHER_RATIO: float = 0.25  # Higher SoC bat gets 25%
@@ -510,10 +515,43 @@ class ControlEngine:
             if bat.power_w < 0:  # Negative = charging
                 available_surplus_w += int(abs(bat.power_w))
 
-        # Subtract hysteresis margin to avoid grid import
-        available_surplus_w = max(
-            0, available_surplus_w - int(self._GRID_HYSTERESIS_W),
+        # PLAT-1674: Aggressive grid regulation — target grid ≈ 0W (±100W).
+        # Only subtract hysteresis when IMPORTING (avoid oscillation).
+        # When EXPORTING: use full surplus (absorb all PV, minimize export).
+        if house_grid_power_w > 0:
+            # Importing — back off slightly to avoid overshoot
+            available_surplus_w = max(
+                0, available_surplus_w - int(self._GRID_HYSTERESIS_W),
+            )
+
+        # PLAT-1674: FM priority — EV before bat when EV connected + FM
+        # FM (06-12): EV gets surplus first, bat gets remainder
+        # EM (12+): bat gets surplus first, EV after bat full
+        _FM_START_H = 6
+        _FM_END_H = 12
+        ev_fm_priority = (
+            _FM_START_H <= snapshot.hour < _FM_END_H
+            and snapshot.ev.connected
+            and snapshot.ev.soc_pct < snapshot.ev.target_soc_pct
         )
+
+        if ev_fm_priority and available_surplus_w >= _EV_MIN_SURPLUS_W:
+            # FM + EV connected + surplus ≥ 1.4 kW:
+            # EV FIRST, remainder to bat (NEVER export)
+            ev_cmds = self._ev_surplus_evaluate(
+                available_surplus_w, house_grid_power_w, snapshot,
+            )
+            ev_used_w: int = 0
+            if self._ev_surplus and self._ev_surplus.is_charging:
+                ev_used_w = int(
+                    self._ev_surplus.current_amps
+                    * self._ev_surplus._cfg.w_per_amp
+                )
+            # Remainder after EV → bat (not export!)
+            available_surplus_w = max(0, available_surplus_w - ev_used_w)
+            if ev_cmds:
+                await self._executor.execute(ev_cmds)
+            # Fall through to bat allocation with reduced surplus
 
         # SoC balancing: allocate surplus between batteries
         bat_socs = {b.battery_id: b.soc_pct for b in snapshot.batteries}
@@ -563,14 +601,16 @@ class ControlEngine:
             soc_diff = abs(bat_socs[ids[0]] - bat_socs[ids[1]])
 
             if soc_diff > self._SOC_BALANCE_THRESHOLD_PCT:
-                # Unbalanced — charge lower SoC, actively discharge higher SoC
+                # Unbalanced — lower SoC gets MORE, higher gets LESS
+                # (NEVER 100/0 — both must charge to 100%)
                 lower_id = (
                     ids[0] if bat_socs[ids[0]] < bat_socs[ids[1]]
                     else ids[1]
                 )
                 higher_id = ids[1] if lower_id == ids[0] else ids[0]
-                allocations[lower_id] = available_surplus_w  # 100% to lower
-                discharge_ids.add(higher_id)  # Higher SoC → active discharge
+                # 80/20 split — lower catches up, higher still charges
+                allocations[lower_id] = int(available_surplus_w * 0.8)
+                allocations[higher_id] = int(available_surplus_w * 0.2)
             else:
                 # Balanced — proportional by capacity
                 for bid in ids:
