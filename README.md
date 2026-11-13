@@ -1,59 +1,61 @@
-# CARMA Box — Home Assistant Add-on
+# CARMA Box – tillägg för Home Assistant
 
-Smart energy optimization for residential solar + battery systems.
+Intelligent energioptimering för bostäder med solceller och batterilagring.
 
-## What it does
+## Funktioner
 
-- Manages GoodWe ET inverters (charge/discharge/standby)
-- Optimizes EV charging (Easee) with grid-aware ramp logic
-- Dispatches surplus PV to consumers (heat pumps, pool, miner)
-- Peak shaving against Ellevio weighted hourly average
-- 8-scenario state machine with safety guards (G0-G7)
+- Styr GoodWe ET-växelriktare för laddning, urladdning och viloläge.
+- Optimerar laddning av elfordon via Easee med hänsyn till elnätet och stegvis reglering.
+- Fördelar överskottsel från solceller till förbrukare, exempelvis värmepumpar, pool och utrustning för kryptoutvinning.
+- Begränsar effekttoppar utifrån Ellevios viktade timmedelvärde.
+- Använder en tillståndsmaskin med åtta scenarier och säkerhetsspärrarna G0–G7.
 
 ## Installation
 
-1. In Home Assistant, go to **Settings → Add-ons → Add-on Store**
-2. Click **⋮ → Repositories** and add:
+1. Öppna **Inställningar → Tillägg → Tilläggsbutiken** i Home Assistant.
+2. Välj **⋮ → Arkiv** och lägg till:
    ```
    https://github.com/11z4t/carma-box-addon
    ```
-3. Find **CARMA Box** in the store and click **Install**
-4. Configure `site.yaml` (see below)
-5. Start the add-on
+3. Leta upp **CARMA Box** i butiken och välj **Installera**.
+4. Konfigurera `site.yaml` enligt anvisningarna nedan.
+5. Starta tillägget.
 
-## Configuration
+## Konfiguration
 
-Copy the example config and edit for your site:
+Kopiera exempelkonfigurationen och anpassa den till anläggningen:
 
 ```bash
 cp /addon_configs/carma-box/site.yaml.example /addon_configs/carma-box/site.yaml
 ```
 
-Edit entity IDs to match your HA installation. See [carma-box-v2](https://github.com/11z4t/carma-box-v2) for full documentation.
+Ändra entitets-ID:na så att de motsvarar din Home Assistant-installation. Fullständig dokumentation finns i [carma-box-v2](https://github.com/11z4t/carma-box-v2).
 
-## Monitoring
+## Övervakning
 
-- **Logs:** Add-on log tab in HA UI
-- **Health:** `http://homeassistant.local:8412/health`
-- **Metrics:** `http://homeassistant.local:8412/metrics` (Prometheus)
-- **Dashboard sensors:** `sensor.carma_box_scenario`, `sensor.carma_box_decision_reason`
+- **Loggar:** Tilläggets loggflik i Home Assistants gränssnitt.
+- **Driftstatus:** `http://homeassistant.local:8412/health`.
+- **Mätvärden:** `http://homeassistant.local:8412/metrics` i Prometheus-format.
+- **Sensorer för översikten:** `sensor.carma_box_scenario` och `sensor.carma_box_decision_reason`.
 
-## Architecture
+## Arkitektur
 
-The add-on runs [CARMA Box v2](https://github.com/11z4t/carma-box-v2) as a standalone Python service alongside Home Assistant. It communicates via the Supervisor API — no long-lived tokens needed.
+Tillägget kör [CARMA Box v2](https://github.com/11z4t/carma-box-v2) som en fristående Python-tjänst vid sidan av Home Assistant. Kommunikationen sker via Supervisor-API:et, utan långlivade åtkomsttoken.
 
-```
-30s cycle: COLLECT → GUARD → SCENARIO → BALANCE → EXECUTE → PERSIST
-```
+Varje 30-sekunderscykel omfattar insamling, säkerhetskontroll, scenarioval, balansering, verkställande och lagring. Motsvarande tekniska steg heter `COLLECT`, `GUARD`, `SCENARIO`, `BALANCE`, `EXECUTE` och `PERSIST`.
 
-## Hardware Requirements
+## Hårdvarukrav
 
-- Home Assistant OS (RPi 4/5, x86, or VM)
-- GoodWe ET inverter with HACS integration
-- Easee EV charger (optional)
-- 512MB free RAM
+- Home Assistant OS på Raspberry Pi 4 eller 5, x86-dator eller virtuell maskin.
+- GoodWe ET-växelriktare med HACS-integration.
+- Easee-laddbox, valfritt.
+- 512 MB ledigt arbetsminne.
 
-## Links
+## Länkar
 
-- [Application source](https://github.com/11z4t/carma-box-v2)
-- [Changelog](https://github.com/11z4t/carma-box-v2/blob/master/CHANGELOG.md)
+- [Applikationens källkod](https://github.com/11z4t/carma-box-v2)
+- [Ändringshistorik](https://github.com/11z4t/carma-box-v2/blob/master/CHANGELOG.md)
+
+## Språk
+
+Se projektets [språkregler](LANGUAGE.md).
